@@ -1,0 +1,425 @@
+<!DOCTYPE html>
+<html>
+<head>
+<style>
+    body {
+  font-family: Arial, sans-serif;
+  margin: 0;
+  padding: 0 0 200px 0;
+  background-color: #f4f4f4;
+}
+
+h2, h3 {
+  color: #333;
+  padding: 20px;
+}
+
+h3 {
+  display: flex;
+  align-items: center;
+}
+
+input[type="file"] {
+  display: block;
+  margin: 20px;
+}
+
+button {
+  background-color: #4CAF50; /* Green */
+  border: none;
+  color: white;
+  padding: 15px 32px;
+  text-align: center;
+  text-decoration: none;
+  display: inline-block;
+  font-size: 16px;
+  margin: 5px;
+}
+
+.image-container {
+  display: flex;
+  justify-content: space-around;
+  align-items: center;
+}
+
+.image-container canvas {
+  max-width: 100%;
+  border: 2px solid #333;
+}
+
+.instructions {
+  background-color: #e8f5e8;
+  padding: 15px;
+  margin: 20px auto;
+  border-radius: 5px;
+  border-left: 5px solid #4CAF50;
+  width: 80%;
+  max-width: 600px;
+  text-align: left;
+}
+
+.status {
+  font-weight: bold;
+  color: #333;
+  margin: 10px 20px;
+}
+</style>
+</head>
+<body>
+    <center>
+<h2>Optimal Path Finding</h2>
+
+<div class="instructions">
+  <strong>Instructions:</strong><br>
+  1. Upload an image<br>
+  2. Click "Select Start Point" and click on the image to set the starting position<br>
+  3. Click "Select End Point" and click on the image to set the destination<br>
+  4. Click "Find Optimal Path" to calculate and display the path
+</div>
+
+<input type="file" id="image-file" accept="image/*">
+<button onclick="loadImage()">Load Image</button>
+<button onclick="selectStartPoint()">Select Start Point</button>
+<button onclick="selectEndPoint()">Select End Point</button>
+<button onclick="findOptimalPath()">Find Optimal Path</button>
+<button onclick="reset()">Reset</button>
+
+<div id="status" class="status"></div>
+
+<h3>Path Visualization:</h3>
+<div class="image-container">
+  <canvas id="path-canvas" width="640" height="480"></canvas>
+</div>
+
+<script>
+let imageLoaded = false;
+let selectingStart = false;
+let selectingEnd = false;
+let startPoint = null;
+let endPoint = null;
+let originalImageData = null;
+let ctx = null;
+
+// Each grid cell = SCALE x SCALE pixels.
+// Reduces search space from ~307,200 nodes → ~4,800 nodes (SCALE=8 on 640x480)
+const SCALE = 4;
+
+function loadImage() {
+  const fileInput = document.getElementById('image-file');
+  const file = fileInput.files[0];
+  if (!file) {
+    updateStatus('Please select an image file first.');
+    return;
+  }
+
+  const reader = new FileReader();
+  reader.onload = function(e) {
+    const img = new Image();
+    img.onload = function() {
+      const canvas = document.getElementById('path-canvas');
+      ctx = canvas.getContext('2d');
+
+      const maxWidth = 800;
+      const maxHeight = 600;
+      let { width, height } = img;
+
+      if (width > maxWidth || height > maxHeight) {
+        const ratio = Math.min(maxWidth / width, maxHeight / height);
+        width *= ratio;
+        height *= ratio;
+      }
+
+      canvas.width = width;
+      canvas.height = height;
+
+      ctx.drawImage(img, 0, 0, width, height);
+      originalImageData = ctx.getImageData(0, 0, width, height);
+      imageLoaded = true;
+      updateStatus('Image loaded successfully. Click "Select Start Point" to begin.');
+    };
+    img.src = e.target.result;
+  };
+  reader.readAsDataURL(file);
+}
+
+function selectStartPoint() {
+  if (!imageLoaded) { updateStatus('Please load an image first.'); return; }
+  selectingStart = true;
+  selectingEnd = false;
+  updateStatus('Click on the image to set the start point.');
+}
+
+function selectEndPoint() {
+  if (!imageLoaded) { updateStatus('Please load an image first.'); return; }
+  selectingStart = false;
+  selectingEnd = true;
+  updateStatus('Click on the image to set the end point.');
+}
+
+function findOptimalPath() {
+  if (!imageLoaded || !startPoint || !endPoint) {
+    updateStatus('Please load an image and select both start and end points.');
+    return;
+  }
+
+  updateStatus('Calculating optimal path...');
+
+  const width = ctx.canvas.width;
+  const height = ctx.canvas.height;
+
+  // Build cost grid at reduced resolution
+  const { costGrid, gw, gh } = createCostGrid(width, height);
+
+  // Convert pixel coords to grid coords
+  const gs = {
+    x: Math.min(Math.floor(startPoint.x / SCALE), gw - 1),
+    y: Math.min(Math.floor(startPoint.y / SCALE), gh - 1)
+  };
+  const ge = {
+    x: Math.min(Math.floor(endPoint.x / SCALE), gw - 1),
+    y: Math.min(Math.floor(endPoint.y / SCALE), gh - 1)
+  };
+
+  const gridPath = aStar(gs, ge, costGrid, gw, gh);
+
+  if (gridPath) {
+    // Convert grid path back to pixel coords (center of each cell)
+    const pixelPath = gridPath.map(p => ({
+      x: p.x * SCALE + Math.floor(SCALE / 2),
+      y: p.y * SCALE + Math.floor(SCALE / 2)
+    }));
+    drawPath(pixelPath);
+    updateStatus(`Optimal path found! Path length: ${pixelPath.length} points.`);
+  } else {
+    drawPath([]);
+    updateStatus('No path found between the selected points. Try moving points to open areas.');
+  }
+}
+
+function reset() {
+  startPoint = null;
+  endPoint = null;
+  selectingStart = false;
+  selectingEnd = false;
+  if (originalImageData) {
+    ctx.putImageData(originalImageData, 0, 0);
+  }
+  updateStatus('Reset complete. Load a new image to start over.');
+}
+
+// ─── MinHeap priority queue ───────────────────────────────────────────────────
+// Replaces the original O(n) linear scan over openSet — critical performance fix
+class MinHeap {
+  constructor() { this.data = []; }
+  push(item) { this.data.push(item); this._up(this.data.length - 1); }
+  pop() {
+    const top = this.data[0];
+    const last = this.data.pop();
+    if (this.data.length > 0) { this.data[0] = last; this._down(0); }
+    return top;
+  }
+  get size() { return this.data.length; }
+  _up(i) {
+    while (i > 0) {
+      const p = (i - 1) >> 1;
+      if (this.data[p].f <= this.data[i].f) break;
+      [this.data[p], this.data[i]] = [this.data[i], this.data[p]];
+      i = p;
+    }
+  }
+  _down(i) {
+    const n = this.data.length;
+    while (true) {
+      let s = i, l = 2*i+1, r = 2*i+2;
+      if (l < n && this.data[l].f < this.data[s].f) s = l;
+      if (r < n && this.data[r].f < this.data[s].f) s = r;
+      if (s === i) break;
+      [this.data[s], this.data[i]] = [this.data[i], this.data[s]];
+      i = s;
+    }
+  }
+}
+
+// ─── A* on the downscaled grid ────────────────────────────────────────────────
+function aStar(start, end, costGrid, gw, gh) {
+  const idx = (x, y) => y * gw + x;
+  const total = gw * gh;
+
+  // Typed arrays for performance — avoids slow Map/Set string key lookups
+  const gScore   = new Float32Array(total).fill(Infinity);
+  const fScore   = new Float32Array(total).fill(Infinity);
+  const cameFrom = new Int32Array(total).fill(-1);
+  const closed   = new Uint8Array(total);
+
+  const si = idx(start.x, start.y);
+  const ei = idx(end.x, end.y);
+
+  gScore[si] = 0;
+  fScore[si] = heuristic(start, end);
+
+  const heap = new MinHeap();
+  heap.push({ x: start.x, y: start.y, f: fScore[si] });
+
+  const dirs = [
+    { dx: -1, dy:  0, cost: 1         },
+    { dx:  1, dy:  0, cost: 1         },
+    { dx:  0, dy: -1, cost: 1         },
+    { dx:  0, dy:  1, cost: 1         },
+    { dx: -1, dy: -1, cost: Math.SQRT2 },
+    { dx:  1, dy: -1, cost: Math.SQRT2 },
+    { dx: -1, dy:  1, cost: Math.SQRT2 },
+    { dx:  1, dy:  1, cost: Math.SQRT2 }
+  ];
+
+  while (heap.size > 0) {
+    const cur = heap.pop();
+    const ci = idx(cur.x, cur.y);
+
+    if (closed[ci]) continue;
+    closed[ci] = 1;
+
+    if (ci === ei) {
+      // Reconstruct path by walking cameFrom back to start
+      const path = [];
+      let node = ei;
+      while (node !== -1) {
+        path.unshift({ x: node % gw, y: Math.floor(node / gw) });
+        node = cameFrom[node];
+      }
+      return path;
+    }
+
+    for (const { dx, dy, cost } of dirs) {
+      const nx = cur.x + dx, ny = cur.y + dy;
+      if (nx < 0 || ny < 0 || nx >= gw || ny >= gh) continue;
+      const ni = idx(nx, ny);
+      if (closed[ni]) continue;
+
+      const ng = gScore[ci] + cost * costGrid[ny][nx];
+      if (ng < gScore[ni]) {
+        cameFrom[ni] = ci;
+        gScore[ni] = ng;
+        fScore[ni] = ng + heuristic({ x: nx, y: ny }, end);
+        heap.push({ x: nx, y: ny, f: fScore[ni] });
+      }
+    }
+  }
+
+  return null; // No path found
+}
+
+// ─── Cost grid: averages pixel costs across each SCALE×SCALE cell ─────────────
+function createCostGrid(width, height) {
+  const gw = Math.ceil(width / SCALE);
+  const gh = Math.ceil(height / SCALE);
+  const costGrid = [];
+  const imageData = ctx.getImageData(0, 0, width, height).data;
+
+  for (let gy = 0; gy < gh; gy++) {
+    costGrid[gy] = [];
+    for (let gx = 0; gx < gw; gx++) {
+      let totalCost = 0, count = 0;
+
+      for (let dy = 0; dy < SCALE && gy*SCALE+dy < height; dy++) {
+        for (let dx = 0; dx < SCALE && gx*SCALE+dx < width; dx++) {
+          const px = gx*SCALE + dx, py = gy*SCALE + dy;
+          const i = (py * width + px) * 4;
+          const r = imageData[i], g = imageData[i+1], b = imageData[i+2];
+
+          // Greenness penalty: dense vegetation = harder to traverse
+          const greenness = g - (r + b) / 2;
+          // Darkness penalty: dark areas = dense canopy / obstacles
+          const brightness = (r + g + b) / 3;
+          const darkness = Math.max(0, 80 - brightness) / 80;
+
+          totalCost += (greenness > 20 ? 8 : 1) + darkness * 5;
+          count++;
+        }
+      }
+
+      costGrid[gy][gx] = totalCost / count;
+    }
+  }
+
+  return { costGrid, gw, gh };
+}
+
+// Octile heuristic — optimal for 8-directional movement (no overestimation)
+function heuristic(a, b) {
+  const dx = Math.abs(a.x - b.x), dy = Math.abs(a.y - b.y);
+  return Math.max(dx, dy) + (Math.SQRT2 - 1) * Math.min(dx, dy);
+}
+
+function drawPath(path) {
+  ctx.putImageData(originalImageData, 0, 0);
+
+  // Draw start point (green)
+  if (startPoint) {
+    ctx.fillStyle = 'green';
+    ctx.beginPath();
+    ctx.arc(startPoint.x, startPoint.y, 8, 0, 2 * Math.PI);
+    ctx.fill();
+    ctx.strokeStyle = 'darkgreen';
+    ctx.lineWidth = 2;
+    ctx.stroke();
+  }
+
+  // Draw end point (red)
+  if (endPoint) {
+    ctx.fillStyle = 'red';
+    ctx.beginPath();
+    ctx.arc(endPoint.x, endPoint.y, 8, 0, 2 * Math.PI);
+    ctx.fill();
+    ctx.strokeStyle = 'darkred';
+    ctx.lineWidth = 2;
+    ctx.stroke();
+  }
+
+  // Draw path (blue line)
+  if (path && path.length > 1) {
+    ctx.strokeStyle = 'blue';
+    ctx.lineWidth = 4;
+    ctx.beginPath();
+    ctx.moveTo(path[0].x, path[0].y);
+    for (let i = 1; i < path.length; i++) {
+      ctx.lineTo(path[i].x, path[i].y);
+    }
+    ctx.stroke();
+
+    // Draw path dots
+    ctx.fillStyle = 'lightblue';
+    for (const point of path) {
+      ctx.beginPath();
+      ctx.arc(point.x, point.y, 2, 0, 2 * Math.PI);
+      ctx.fill();
+    }
+  }
+}
+
+function updateStatus(message) {
+  document.getElementById('status').textContent = message;
+}
+
+document.getElementById('path-canvas').addEventListener('click', function(event) {
+  if (!imageLoaded) return;
+
+  const rect = this.getBoundingClientRect();
+  const x = event.clientX - rect.left;
+  const y = event.clientY - rect.top;
+
+  if (selectingStart) {
+    startPoint = { x: Math.round(x), y: Math.round(y) };
+    selectingStart = false;
+    drawPath([]);
+    updateStatus(`Start point set at (${startPoint.x}, ${startPoint.y}). Now select end point.`);
+  } else if (selectingEnd) {
+    endPoint = { x: Math.round(x), y: Math.round(y) };
+    selectingEnd = false;
+    drawPath([]);
+    updateStatus(`End point set at (${endPoint.x}, ${endPoint.y}). Click 'Find Optimal Path' to calculate.`);
+  }
+});
+</script>
+
+</body>
+</html>
